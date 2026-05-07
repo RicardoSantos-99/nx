@@ -323,44 +323,95 @@ defmodule Nx.Defn.Graph do
     {other, {cache, state}}
   end
 
-  defp split_before(expr, args, {cache, state}) do
-    # We need to save this so that each previous stage
-    # isn't affected by following ones
-    nodes_to_replace = state.nodes_to_replace
+  defp split_before_process_tensor_arg(arg, stage_id, {tensor_args, out_position, state}) do
+    case arg do
+      %T{data: %Expr{op: :parameter}} = arg ->
+        state =
+          case Map.has_key?(state.args, arg.data.id) do
+            false ->
+              %{state | args: Map.put(state.args, arg.data.id, {stage_id, out_position})}
 
+            true ->
+              state
+          end
+
+        {arg, {tensor_args, out_position, state}}
+
+      %T{data: %Expr{}} = expr ->
+        param = Expr.parameter(expr, map_size(state.args))
+
+        state = %{
+          state
+          | args: Map.put(state.args, param.data.id, {stage_id, out_position}),
+            nodes_to_replace: Map.put(state.nodes_to_replace, expr.data.id, param)
+        }
+
+        {param, {[expr | tensor_args], out_position + 1, state}}
+
+      other ->
+        {other, {tensor_args, out_position, state}}
+    end
+  end
+
+  defp split_before(%T{data: %Expr{op: :runtime_call}} = expr, args, {cache, state}) do
+    nodes_to_replace = state.nodes_to_replace
+    stage_id = make_ref()
+
+    [tensor_expr, callback, out_template, opts] = args
+
+    {tensor_expr, {tensor_args, _out_position, state}} =
+      Composite.traverse(tensor_expr, {[], 0, state}, fn leaf, acc ->
+        split_before_process_tensor_arg(leaf, stage_id, acc)
+      end)
+
+    args = [tensor_expr, callback, out_template, opts]
+
+    split_before_finish(expr, args, tensor_args, stage_id, nodes_to_replace, state, cache)
+  end
+
+  defp split_before(%T{data: %Expr{op: :block}} = expr, args, {cache, state}) do
+    nodes_to_replace = state.nodes_to_replace
+    stage_id = make_ref()
+
+    [struct, in_args, subexpr, callback] = args
+
+    {in_args, {tensor_args, _out_position, state}} =
+      Enum.map_reduce(in_args, {[], 0, state}, fn
+        elem, acc when is_list(elem) ->
+          {elem, acc}
+
+        elem, acc ->
+          Composite.traverse(elem, acc, fn leaf, inner_acc ->
+            split_before_process_tensor_arg(leaf, stage_id, inner_acc)
+          end)
+      end)
+
+    args = [struct, in_args, subexpr, callback]
+
+    split_before_finish(expr, args, tensor_args, stage_id, nodes_to_replace, state, cache)
+  end
+
+  defp split_before(expr, args, {cache, state}) do
+    nodes_to_replace = state.nodes_to_replace
     stage_id = make_ref()
 
     {args, {tensor_args, _out_position, state}} =
-      Enum.map_reduce(args, {[], 0, state}, fn
-        %T{data: %Expr{op: :parameter}} = arg, {tensor_args, out_position, state} ->
-          # Parameters are not computed values, so don't add them to tensor_args
-          # Just update the state if needed
-          state =
-            case Map.has_key?(state.args, arg.data.id) do
-              false ->
-                %{state | args: Map.put(state.args, arg.data.id, {stage_id, out_position})}
-
-              true ->
-                state
-            end
-
-          {arg, {tensor_args, out_position, state}}
-
-        %T{} = expr, {tensor_args, out_position, state} ->
-          arg = Expr.parameter(expr, map_size(state.args))
-
-          state = %{
-            state
-            | args: Map.put(state.args, arg.data.id, {stage_id, out_position}),
-              nodes_to_replace: Map.put(state.nodes_to_replace, expr.data.id, arg)
-          }
-
-          {arg, {[expr | tensor_args], out_position + 1, state}}
-
-        non_tensor_arg, acc ->
-          {non_tensor_arg, acc}
+      Enum.map_reduce(args, {[], 0, state}, fn arg, acc ->
+        split_before_process_tensor_arg(arg, stage_id, acc)
       end)
 
+    split_before_finish(expr, args, tensor_args, stage_id, nodes_to_replace, state, cache)
+  end
+
+  defp split_before_finish(
+         expr,
+         args,
+         tensor_args,
+         stage_id,
+         nodes_to_replace,
+         state,
+         cache
+       ) do
     new_expr = put_in(expr.data.args, args)
 
     {stage_expr, result_expr} =
@@ -437,6 +488,42 @@ defmodule Nx.Defn.Graph do
     {result_expr, {cache, state}}
   end
 
+  defp split_both_collect_expr_sources(
+         %T{data: %Expr{op: :runtime_call}},
+         [tensor_expr, _callback, _out_template, _opts]
+       ) do
+    Composite.reduce(tensor_expr, [], fn
+      %T{data: %Expr{op: :parameter}}, acc -> acc
+      %T{data: %Expr{}} = t, acc -> [t | acc]
+      _, acc -> acc
+    end)
+  end
+
+  defp split_both_collect_expr_sources(
+         %T{data: %Expr{op: :block}},
+         [_struct, in_args, _subexpr, _callback]
+       ) do
+    Enum.reduce(in_args, [], fn
+      elem, acc when is_list(elem) ->
+        acc
+
+      elem, acc ->
+        Composite.reduce(elem, acc, fn
+          %T{data: %Expr{op: :parameter}}, a -> a
+          %T{data: %Expr{}} = t, a -> [t | a]
+          _, a -> a
+        end)
+    end)
+  end
+
+  defp split_both_collect_expr_sources(_, args) do
+    Enum.reduce(args, [], fn
+      %T{data: %Expr{op: :parameter}}, acc -> acc
+      %T{data: %Expr{}} = t, acc -> [t | acc]
+      _, acc -> acc
+    end)
+  end
+
   defp split_after(expr, args, {cache, state}) do
     # For :after mode, we create a stage that computes the current node
     nodes_to_replace = state.nodes_to_replace
@@ -474,22 +561,17 @@ defmodule Nx.Defn.Graph do
     # For :both mode, we need to check if split_before would create intermediate computations
     # We use the same logic as split_before to determine this
 
-    tensor_args =
-      Enum.reduce(args, [], fn
-        %T{data: %Expr{op: :parameter}}, acc -> acc
-        %T{} = tensor_expr, acc -> [tensor_expr | acc]
-        _, acc -> acc
-      end)
+    tensor_sources = split_both_collect_expr_sources(expr, args)
 
     # Check if split_before would create a meaningful stage or just a parameter wrapper
     has_intermediate_computations =
-      case {tensor_args, expr.data.op} do
-        # No tensor args means no intermediate computations
+      case {tensor_sources, expr.data.op} do
+        # No splittable tensor sources means no intermediate computations
         {[], _} -> false
         # Metadata operations always create meaningful stages
         {_, :metadata} -> true
-        # Non-empty tensor_args means intermediate computations
-        {_non_empty, _} -> true
+        # Non-empty tensor_sources means intermediate computations
+        {[_ | _], _} -> true
       end
 
     case has_intermediate_computations do

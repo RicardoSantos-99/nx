@@ -713,6 +713,66 @@ defmodule Nx.Defn.GraphTest do
       assert [%{source: {^stage_1_id, 0}}] = stage_2_arguments
     end
 
+    test ":both on :runtime_call (callback and template args are not split)" do
+      expr =
+        Nx.Defn.debug_expr_apply(&Nx.Defn.GraphRuntimeCallSplitStub.rt/1, [
+          Nx.template({2}, :f32)
+        ])
+
+      split_fn = fn
+        %T{data: %Expr{op: :runtime_call}}, _acc -> {:both, nil}
+        _, acc -> {:none, acc}
+      end
+
+      assert {_chain, _, _} = Graph.__split__(expr, nil, split_fn)
+    end
+
+    test ":after on :block completes" do
+      arg0 =
+        Nx.u8([
+          [1, 0, 1],
+          [1, 1, 1]
+        ])
+
+      expr =
+        Nx.Defn.debug_expr(fn a, b ->
+          x = Nx.add(b, 1)
+          y = Nx.sum(x, axes: [1])
+          z = Nx.logical_not(y)
+          Nx.subtract(z, a)
+        end).(1, arg0)
+
+      split_fn = fn
+        %T{data: %Expr{op: :block}}, acc -> {:after, acc}
+        _, acc -> {:none, acc}
+      end
+
+      assert {_chain, _, _} = Graph.__split__(expr, nil, split_fn)
+    end
+
+    test ":both on :block completes" do
+      arg0 =
+        Nx.u8([
+          [1, 0, 1],
+          [1, 1, 1]
+        ])
+
+      expr =
+        Nx.Defn.debug_expr(fn a, b ->
+          x = Nx.add(b, 1)
+          y = Nx.sum(x, axes: [1])
+          z = Nx.logical_not(y)
+          Nx.subtract(z, a)
+        end).(1, arg0)
+
+      split_fn = fn
+        %T{data: %Expr{op: :block}}, acc -> {:both, acc}
+        _, acc -> {:none, acc}
+      end
+
+      assert {_chain, _, _} = Graph.__split__(expr, nil, split_fn)
+    end
+
     test "basic functionality with befor and none returns" do
       expr =
         Nx.Defn.debug_expr(fn arg0, arg1 ->
